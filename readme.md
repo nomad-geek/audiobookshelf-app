@@ -1,5 +1,7 @@
 # Audiobookshelf Mobile App
 
+> **This is a personal fork, not a distribution.** It exists so its owner can build the iOS app under their own Apple developer account for their own devices. Nothing is released from here: no binaries, no TestFlight invitations, no support. For the app itself, use the official project: [advplyr/audiobookshelf-app](https://github.com/advplyr/audiobookshelf-app). The only changes are the iOS bundle identifier and `.github/workflows/personal-testflight.yml`.
+
 Audiobookshelf is a self-hosted audiobook and podcast server.
 
 ### Android (beta)

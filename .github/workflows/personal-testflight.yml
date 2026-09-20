@@ -1,0 +1,189 @@
+name: Personal TestFlight build
+
+# Builds this fork's iOS app under the fork owner's own Apple team and uploads
+# it straight to their TestFlight. Manual runs only. The signed .ipa is never
+# kept as a workflow artifact or a release: this fork is a personal build, not
+# a distribution.
+#
+# Repository secrets:
+#   APPLE_TEAM_ID                 10-character team id
+#   DIST_CERT_P12_BASE64          Apple Distribution certificate + key, base64
+#   DIST_CERT_PASSWORD            password of that .p12
+#   PROVISIONING_PROFILE_BASE64   App Store profile for the bundle id, base64
+#   ASC_KEY_ID                    App Store Connect API key id
+#   ASC_ISSUER_ID                 App Store Connect API issuer id
+#   ASC_KEY_P8_BASE64             the API key's .p8 file, base64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-testflight
+  cancel-in-progress: false
+
+env:
+  BUNDLE_ID: org.nomadgeek.audiobookshelf
+
+jobs:
+  testflight:
+    name: Archive and upload to TestFlight
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check that every signing secret is set
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DIST_CERT_P12_BASE64: ${{ secrets.DIST_CERT_P12_BASE64 }}
+          DIST_CERT_PASSWORD: ${{ secrets.DIST_CERT_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          missing=0
+          for name in APPLE_TEAM_ID DIST_CERT_P12_BASE64 DIST_CERT_PASSWORD \
+            PROVISIONING_PROFILE_BASE64 ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_BASE64; do
+            if [ -z "${!name}" ]; then
+              echo "::error::repository secret $name is not set"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci --omit=optional
+
+      - name: Build shared web app
+        run: npm run generate
+
+      - name: Sync Capacitor iOS project
+        run: npx cap sync ios
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios/App
+        run: pod install --deployment
+
+      - name: Install signing certificate and provisioning profile
+        env:
+          DIST_CERT_P12_BASE64: ${{ secrets.DIST_CERT_P12_BASE64 }}
+          DIST_CERT_PASSWORD: ${{ secrets.DIST_CERT_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+
+          printf '%s' "$DIST_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$DIST_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          rm "$RUNNER_TEMP/dist.p12"
+
+          profile="$RUNNER_TEMP/app.mobileprovision"
+          printf '%s' "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$profile"
+          security cms -D -i "$profile" > "$RUNNER_TEMP/profile.plist"
+          uuid="$(plutil -extract UUID raw "$RUNNER_TEMP/profile.plist")"
+          name="$(plutil -extract Name raw "$RUNNER_TEMP/profile.plist")"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$profile" "$HOME/Library/MobileDevice/Provisioning Profiles/$uuid.mobileprovision"
+          echo "PROFILE_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Point the Release configuration at the personal team
+        working-directory: ios/App
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # Signing settings go on the app target only. Passed on the xcodebuild
+          # command line they would reach the CocoaPods targets too, which
+          # reject a provisioning profile.
+          python3 - <<'PY'
+          import os, re
+          path = "App.xcodeproj/project.pbxproj"
+          src = open(path).read()
+          bundle = os.environ["BUNDLE_ID"]
+          # One match per build configuration: from its isa line to its name.
+          blocks = re.findall(r"isa = XCBuildConfiguration;.*?name = \w+;", src, flags=re.S)
+          target = [b for b in blocks if b.endswith("name = Release;")
+                    and f"PRODUCT_BUNDLE_IDENTIFIER = {bundle};" in b]
+          assert len(target) == 1, f"expected one Release block for {bundle}, found {len(target)}"
+          new = target[0]
+          new = re.sub(r"CODE_SIGN_STYLE = \w+;", "CODE_SIGN_STYLE = Manual;", new)
+          new = re.sub(r"DEVELOPMENT_TEAM = \w+;", f'DEVELOPMENT_TEAM = {os.environ["APPLE_TEAM_ID"]};', new)
+          new = re.sub(r"CURRENT_PROJECT_VERSION = \d+;", f'CURRENT_PROJECT_VERSION = {os.environ["GITHUB_RUN_NUMBER"]};', new)
+          new = new.replace("buildSettings = {", "buildSettings = {\n"
+              '\t\t\t\tCODE_SIGN_IDENTITY = "Apple Distribution";\n'
+              f'\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "{os.environ["PROFILE_NAME"]}";', 1)
+          open(path, "w").write(src.replace(target[0], new))
+          PY
+          # The app only uses standard HTTPS, which is exempt; saying so here
+          # stops TestFlight asking the export-compliance question per build.
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" App/Info.plist
+
+      - name: Archive
+        working-directory: ios/App
+        run: |
+          xcodebuild -quiet \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            archive
+
+      - name: Upload to TestFlight
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > "$key"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict><key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string></dict>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -authenticationKeyPath "$key" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -rf "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/app.mobileprovision" \
+            "$RUNNER_TEMP/App.xcarchive" "$RUNNER_TEMP/export" \
+            "$HOME/Library/MobileDevice/Provisioning Profiles"/*.mobileprovision
